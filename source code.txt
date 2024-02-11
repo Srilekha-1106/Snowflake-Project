@@ -1,0 +1,361 @@
+//Creating a warehouse
+CREATE OR REPLACE WAREHOUSE COMPUTING_WAREHOUSE
+WITH
+WAREHOUSE_SIZE = XSMALL
+AUTO_SUSPEND=600
+AUTO_RESUME=TRUE
+INITIALLY_SUSPENDED=TRUE;
+
+//Creating a database
+CREATE OR REPLACE DATABASE EMPLOYEE_DB;
+
+//Creating a schema to store the stage object
+CREATE OR REPLACE SCHEMA EMPLOYEE_DB.EXTERNAL_STAGES;
+
+//Create a storage integration object to access the dumped data in aws
+CREATE OR REPLACE STORAGE INTEGRATION S3_INT
+TYPE = EXTERNAL_STAGE
+STORAGE_PROVIDER = S3
+ENABLED = TRUE
+STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::471112821029:role/snowflakeprojectsrilekha'
+STORAGE_ALLOWED_LOCATIONS = ('s3://myprojectbucketsrilekha/json/');
+
+DESC INTEGRATION S3_INT;
+
+//Creating a json file format
+CREATE OR REPLACE FILE FORMAT JSONFORMAT
+TYPE = JSON;
+
+//Creating a stage object to store the data.
+CREATE OR REPLACE stage EMPLOYEE_DB.EXTERNAL_STAGES.JSONSTAGE
+url='s3://myprojectbucketsrilekha/json/'
+     STORAGE_INTEGRATION = S3_INT
+     FILE_FORMAT = EMPLOYEE_DB.EXTERNAL_STAGES.JSONFORMAT;
+     
+LIST @EMPLOYEE_DB.EXTERNAL_STAGES.JSONSTAGE;
+
+//Creating a table to store the json data
+CREATE OR REPLACE TABLE EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON(
+raw_file variant
+);
+
+//Copying the data into the created json table
+COPY INTO EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON 
+FROM @EMPLOYEE_DB.EXTERNAL_STAGES.JSONSTAGE
+FILE_FORMAT = (FORMAT_NAME = JSONFORMAT);
+
+SELECT * FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON;
+
+//Transforming json to csv 
+SELECT
+raw_file:id::NUMBER as ID,
+raw_file:city::STRING AS CITY,
+raw_file:first_name::STRING AS FIRST_NAME,
+raw_file:last_name::STRING AS LAST_NAME,
+raw_file:gender::STRING AS GENDER,
+raw_file:job.salary::NUMBER AS SALARY,
+raw_file:job.title::STRING AS TITLE,
+f1.value::string AS PREV_COMPANY,
+f.value:language::STRING AS LANGUAGE,
+f.value:level::STRING AS LEVEL
+FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON, TABLE(FLATTEN(RAW_FILE:spoken_languages)) f left join table(FLATTEN(input => raw_file:prev_company, OUTER=> TRUE)) AS f1
+order by id;
+
+//Creating a new table to store the new csv data. 
+CREATE OR REPLACE TABLE EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED
+AS(
+SELECT
+raw_file:id::NUMBER as ID,
+raw_file:city::STRING AS CITY,
+raw_file:first_name::STRING AS FIRST_NAME,
+raw_file:last_name::STRING AS LAST_NAME,
+raw_file:gender::STRING AS GENDER,
+raw_file:job.salary::NUMBER AS SALARY,
+raw_file:job.title::STRING AS TITLE,
+f1.value::string AS PREV_COMPANY,
+f.value:language::STRING AS LANGUAGE,
+f.value:level::STRING AS LEVEL
+FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON, TABLE(FLATTEN(RAW_FILE:spoken_languages)) f left join table(FLATTEN(input => raw_file:prev_company, OUTER=> TRUE)) AS f1
+order by id
+);
+
+SELECT * FROM EMPLOYEE_STRUCTURED;
+
+//Adding few decison making fields and a new table to store this data will be created later
+SELECT
+raw_file:id::NUMBER as ID,
+raw_file:city::STRING AS CITY,
+raw_file:first_name::STRING AS FIRST_NAME,
+raw_file:last_name::STRING AS LAST_NAME,
+raw_file:gender::STRING AS GENDER,
+raw_file:job.salary::NUMBER AS SALARY,
+CASE
+    WHEN raw_file:job.salary::NUMBER > 40000 THEN 'Tax Payer'
+    ELSE 'Not Tax Payer'
+END AS TAX_RETURNS,
+raw_file:job.title::STRING AS TITLE,
+CASE
+WHEN f1.value is null then 'No Experience'
+ELSE f1.value::string 
+END AS PREV_COMPANY,
+f.value:language::STRING AS LANGUAGE,
+f.value:level::STRING AS LEVEL
+FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON, TABLE(FLATTEN(RAW_FILE:spoken_languages)) f left join table(FLATTEN(input => raw_file:prev_company, OUTER=> TRUE)) AS f1
+order by id;
+
+
+//Creating a snowpipe to hear the S3 notifications
+CREATE OR REPLACE SCHEMA EMPLOYEE_DB.PIPES;
+CREATE OR REPLACE PIPE EMPLOYEE_DB.PIPES.EMPLOYEE_PIPE
+AUTO_INGEST = TRUE
+AS
+COPY INTO EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON
+FROM @EMPLOYEE_DB.EXTERNAL_STAGES.JSONSTAGE;
+
+DESC PIPE EMPLOYEE_PIPE;
+
+//Error Handling in the pipe
+//Validating pipe is actually working
+ALTER PIPE EMPLOYEE_DB.PIPES.EMPLOYEE_PIPE REFRESH;
+
+// Snowpipe error message
+SELECT * FROM TABLE(VALIDATE_PIPE_LOAD(
+    PIPE_NAME => 'EMPLOYEE_DB.PIPES.EMPLOYEE_PIPE',
+    START_TIME => DATEADD(HOUR,-2,CURRENT_TIMESTAMP())));
+
+// COPY command history from table to see error massage
+SELECT * FROM TABLE (INFORMATION_SCHEMA.COPY_HISTORY(
+   table_name  =>  'EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON',
+   START_TIME =>  DATEADD(HOUR,-2,CURRENT_TIMESTAMP())));
+
+//Giving access to a non snowflake user. Creating a reader account.
+CREATE OR REPLACE SHARE EMPLOYEES_SHARE;
+
+GRANT USAGE ON DATABASE EMPLOYEE_DB TO SHARE EMPLOYEES_SHARE;
+
+GRANT USAGE ON SCHEMA EMPLOYEE_DB.PUBLIC
+TO SHARE EMPLOYEES_SHARE;
+
+GRANT SELECT ON TABLE EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED TO SHARE EMPLOYEES_SHARE;
+
+SHOW GRANTS TO SHARE EMPLOYEES_SHARE;
+
+ALTER SHARE EMPLOYEES_SHARE ADD ACCOUNT =EN89559;
+
+//Create streams and tasks. So to do this we need a source and a destination table
+//Creating a destination table with the decision making fields included
+CREATE OR REPLACE TABLE EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED
+AS(
+SELECT
+raw_file:id::NUMBER as ID,
+raw_file:city::STRING AS CITY,
+raw_file:first_name::STRING AS FIRST_NAME,
+raw_file:last_name::STRING AS LAST_NAME,
+raw_file:gender::STRING AS GENDER,
+raw_file:job.salary::NUMBER AS SALARY,
+CASE
+    WHEN raw_file:job.salary::NUMBER > 40000 THEN 'Tax Payer'
+    ELSE 'Not Tax Payer'
+END AS TAX_RETURNS,
+raw_file:job.title::STRING AS TITLE,
+CASE
+WHEN f1.value is null then 'No Experience'
+ELSE f1.value::string 
+END AS PREV_COMPANY,
+f.value:language::STRING AS LANGUAGE,
+f.value:level::STRING AS LEVEL
+FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_JSON, TABLE(FLATTEN(RAW_FILE:spoken_languages)) f left join table(FLATTEN(input => raw_file:prev_company, OUTER=> TRUE)) AS f1
+order by id
+);
+
+SELECT * FROM EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED;
+
+CREATE OR REPLACE STREAM EMPLOYEE_STREAM ON TABLE EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED;
+
+SHOW STREAMS;
+
+DESC STREAM EMPLOYEE_STREAM;
+
+//Make few updates on the data to check whether the stream is working or not.
+INSERT INTO EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED VALUES
+(201,'Chicago','Loyla','David','Female',45000,'Data Engineer','North Western Mutual Finance Company','Hindi','Advanced');
+INSERT INTO EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED VALUES
+(202,'Boston','Andrea','Jackson','Female',35000,'Data Analyst','Oracle','Hindi','Advanced');
+
+DELETE FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED where id=201;
+
+UPDATE EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED 
+SET CITY ='LOWELL'
+WHERE ID = 202;
+
+SELECT * FROM EMPLOYEE_DB.PUBLIC.EMPLOYEE_STRUCTURED;
+SELECT * FROM EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED;
+SELECT * FROM EMPLOYEE_STREAM;
+
+-- //INSERT
+-- INSERT INTO EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED(ID,CITY,FIRST_NAME,LAST_NAME,GENDER,SALARY,TAX_RETURNS,TITLE,PREV_COMPANY,LANGUAGE,LEVEL)
+-- SELECT
+-- id::NUMBER as ID,
+-- city::STRING AS CITY,
+-- first_name::STRING AS FIRST_NAME,
+-- last_name::STRING AS LAST_NAME,
+-- gender::STRING AS GENDER,
+-- salary::NUMBER AS SALARY,
+-- CASE
+--     WHEN salary::NUMBER > 40000 THEN 'Tax Payer'
+--     ELSE 'Not Tax Payer'
+-- END AS TAX_RETURNS,
+-- title::STRING AS TITLE,
+-- CASE
+-- WHEN prev_company is null then 'No Experience'
+-- ELSE prev_company::string 
+-- END AS PREV_COMPANY,
+-- language::STRING as LANGUAGE,
+-- level::STRING AS LEVEL
+-- FROM EMPLOYEE_STREAM
+-- order by id;
+
+
+-- //UPDATE
+-- MERGE INTO EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED U
+-- USING EMPLOYEE_STREAM S ON U.ID=S.ID
+-- when matched 
+--     and S.METADATA$ACTION ='INSERT'
+--     and S.METADATA$ISUPDATE ='TRUE'      
+--     then update 
+-- SET  
+--     U.ID = S.ID,
+--     U.CITY = S.CITY,
+--     U.FIRST_NAME = S.FIRST_NAME,
+--     U.LAST_NAME = S.LAST_NAME,
+--     U.GENDER = S.GENDER,
+--     U.SALARY = S.SALARY,
+--     U.TAX_RETURNS= CASE 
+--                     WHEN S.SALARY >40000 THEN 'Tax Payer'
+--                     ELSE 'Not Tax Payer'
+--                     END ,
+--     U.TITLE=S.TITLE,
+--     U.PREV_COMPANY=CASE
+--                     WHEN S.PREV_COMPANY is null then 'No Experience'
+--                     ELSE S.PREV_COMPANY::string 
+--                     END,
+--     U.LANGUAGE = S.LANGUAGE,
+--     U.LEVEL = S.LEVEL;
+
+-- //DELETE
+-- MERGE INTO EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED U
+-- USING EMPLOYEE_STREAM S ON U.ID=S.ID
+-- when matched 
+-- and S.METADATA$ACTION ='DELETE' 
+--     and S.METADATA$ISUPDATE = 'FALSE'
+--     then delete;
+
+//Including all the cases in a single code
+CREATE OR REPLACE TASK STREAM_UPDATES
+WAREHOUSE = COMPUTING_WAREHOUSE
+SCHEDULE = '1 MINUTE'
+WHEN SYSTEM$STREAM_HAS_DATA('EMPLOYEE_STREAM')
+AS
+merge into EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED U      
+USING EMPLOYEE_STREAM S 
+ON U.id=S.id
+when matched                       
+    and S.METADATA$ACTION ='DELETE' 
+    and S.METADATA$ISUPDATE = 'FALSE'
+    then delete                   
+when matched                        
+    and S.METADATA$ACTION ='INSERT' 
+    and S.METADATA$ISUPDATE  = 'TRUE'       
+    then update 
+    SET  
+    U.ID = S.ID,
+    U.CITY = S.CITY,
+    U.FIRST_NAME = S.FIRST_NAME,
+    U.LAST_NAME = S.LAST_NAME,
+    U.GENDER = S.GENDER,
+    U.SALARY = S.SALARY,
+    U.TAX_RETURNS= CASE 
+                    WHEN S.SALARY >40000 THEN 'Tax Payer'
+                    ELSE 'Not Tax Payer'
+                    END ,
+    U.TITLE=S.TITLE,
+    U.PREV_COMPANY=CASE
+                    WHEN S.PREV_COMPANY is null then 'No Experience'
+                    ELSE S.PREV_COMPANY::string 
+                    END,
+    U.LANGUAGE = S.LANGUAGE,
+    U.LEVEL = S.LEVEL
+when not matched 
+    and S.METADATA$ACTION ='INSERT'
+then INSERT(ID,CITY,FIRST_NAME,LAST_NAME,GENDER,SALARY,TAX_RETURNS,TITLE,PREV_COMPANY,LANGUAGE,LEVEL)
+VALUES
+(
+S.id::NUMBER,
+S.city::STRING ,
+S.first_name::STRING ,
+S.last_name::STRING ,
+S.gender::STRING,
+S.salary::NUMBER,
+CASE
+    WHEN salary::NUMBER > 40000 THEN 'Tax Payer'
+    ELSE 'Not Tax Payer'
+END,
+S.title::STRING,
+CASE
+WHEN prev_company is null then 'No Experience'
+ELSE prev_company::string 
+END,
+S.language::STRING,
+S.level::STRING
+);
+
+//Resume the task to make it run every minute.
+ALTER TASK STREAM_UPDATES RESUME;
+SHOW TASKS;
+
+//After performing updates like insert,delete,update check whether the data got updated in the table or not
+SELECT * FROM EMPLOYEE_STREAM;
+SELECT * FROM EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED
+ORDER BY ID;
+
+// Verify the history
+select *
+from table(information_schema.task_history())
+order by name asc,scheduled_time desc;
+
+//Creating a Materialized view
+CREATE OR REPLACE MATERIALIZED VIEW EMPLOYERS_MV
+AS 
+SELECT TITLE AS TITLE,MAX(SALARY) AS MAX_SALARY FROM EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED 
+GROUP BY TITLE;
+
+SHOW MATERIALIZED VIEWS;
+SELECT * FROM EMPLOYERS_MV;
+
+//Implementing Dynamic data masking to hide confidential data from specific roles.
+//Create a role and grant privileges to it.
+CREATE OR REPLACE ROLE VIEWER_HIDE_SALARY;
+GRANT USAGE ON WAREHOUSE COMPUTING_WAREHOUSE TO ROLE VIEWER_HIDE_SALARY;
+GRANT USAGE ON DATABASE EMPLOYEE_DB TO ROLE VIEWER_HIDE_SALARY;
+GRANT USAGE ON SCHEMA EMPLOYEE_DB.PUBLIC TO ROLE VIEWER_HIDE_SALARY;
+GRANT SELECT ON TABLE EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED TO ROLE VIEWER_HIDE_SALARY;
+GRANT ROLE VIEWER_HIDE_SALARY TO USER NEWACCOUNT;
+
+//Creating a masking policy
+CREATE OR REPLACE MASKING POLICY SALARY
+AS (VAL NUMBER) RETURNS NUMBER ->
+CASE 
+WHEN CURRENT_ROLE() IN('VIEWER_HIDE_SALARY') THEN 00000
+ELSE VAL
+END;
+
+//Drop the materialized views created on the table to implement the policy.
+DROP MATERIALIZED VIEW EMPLOYERS_MV;
+
+//Implementing the masking policy
+ALTER TABLE IF EXISTS EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED MODIFY COLUMN SALARY
+SET MASKING POLICY SALARY;
+
+//Switch to the created role and check whether the masking policy is working or not.
+USE ROLE VIEWER_HIDE_SALARY;
+SELECT * FROM EMPLOYEE_DB.PUBLIC.UPDATED_EMPLOYEE_STRUCTURED;
